@@ -1,0 +1,15 @@
+.DS_Store
+
+zig-out/
+zig-cache/
+
+.obsidian/
+
+*.id0
+*.id1
+*.id2
+*.nam
+*.til
+*.exe
+*.dll
+*.pdb
