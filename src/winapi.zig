@@ -44,7 +44,13 @@ pub const STD_INPUT_HANDLE = windows.STD_INPUT_HANDLE;
 pub const STD_ERROR_HANDLE = windows.STD_ERROR_HANDLE;
 pub const STD_OUTPUT_HANDLE = windows.STD_OUTPUT_HANDLE;
 
+pub const GetFileAttributes = windows.GetFileAttributes;
+pub const ERROR_FILE_NOT_FOUND = c_long(2);
+pub const INVALID_FILE_ATTRIBUTES = c_long(2);
+
 pub const LPDWORD = [*c]DWORD;
+
+pub const CREATE_SUSPENDED = 4;
 
 pub const LIST_MODULES_64BIT = 0x02;
 pub const LIST_MODULES_DEFAULT = 0x0;

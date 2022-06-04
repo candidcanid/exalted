@@ -7,8 +7,8 @@ const log = std.log;
 const unicode = std.unicode;
 const assert = std.debug.assert;
 
+const clap = @import("zig-clap");
 const winapi = @import("winapi.zig");
-const exalted_options = @import("exalted_options");
 
 pub const TmpDir = struct {
     dir: std.fs.Dir,
@@ -60,172 +60,70 @@ const PipeThread = struct {
     }
 };
 
-fn attachFridaScript(frida_script_path: []const u8, pipe_write_h: winapi.HANDLE) !winapi.HANDLE {
-    var allocator = std.heap.c_allocator;
-
-    const appdata_path = try fs.getAppDataDir(allocator, "");
-    defer allocator.free(appdata_path);
-
-    const pypath = try std.fs.path.join(allocator, &.{
-        appdata_path, "\\Programs\\Python\\Python310\\python.exe",
-    });
-    defer allocator.free(pypath);
-    std.log.debug("pypath: {s}", .{pypath});
-    
-    const pycwd = try std.fs.path.join(allocator, &.{
-        appdata_path, "\\Temp\\",
-    });
-    defer allocator.free(pycwd);
-    std.log.debug("pycwd: {s}", .{pycwd});
-
-    const app_path_w = try unicode.utf8ToUtf16LeWithNull(allocator, pypath);
-    defer allocator.free(app_path_w);
-    
-    const cmdline = try std.fmt.allocPrint(allocator, "-u {s}", .{frida_script_path});
-    defer allocator.free(cmdline);
-
-    const cmd_line_w = try unicode.utf8ToUtf16LeWithNull(allocator, cmdline);
-    defer allocator.free(cmd_line_w);
-
-    const cwd_w = try unicode.utf8ToUtf16LeWithNull(allocator, pycwd);
-    defer allocator.free(cwd_w);
-
-    var siStartInfo = winapi.STARTUPINFOW{
-        .cb = @sizeOf(winapi.STARTUPINFOW),
-        .hStdError = pipe_write_h,
-        .hStdOutput = pipe_write_h,
-        .hStdInput = try winapi.GetStdHandle(winapi.STD_INPUT_HANDLE),
-        .dwFlags = winapi.STARTF_USESTDHANDLES,
-
-        .lpReserved = null,
-        .lpDesktop = null,
-        .lpTitle = null,
-        .dwX = 0,
-        .dwY = 0,
-        .dwXSize = 0,
-        .dwYSize = 0,
-        .dwXCountChars = 0,
-        .dwYCountChars = 0,
-        .dwFillAttribute = 0,
-        .wShowWindow = 0,
-        .cbReserved2 = 0,
-        .lpReserved2 = null,
-    };
-    var piProcInfo: winapi.PROCESS_INFORMATION = undefined;
-
-    try winapi.CreateProcessW(
-        app_path_w,
-        cmd_line_w,
-        null,
-        null,
-        winapi.TRUE,
-        winapi.CREATE_UNICODE_ENVIRONMENT,
-        null,
-        // @ptrCast(?*anyopaque, envp_ptr),
-        cwd_w,
-        &siStartInfo,
-        &piProcInfo,
-    );
-
-    var proc_handle = piProcInfo.hProcess;
-    return proc_handle;
-}
-
 pub fn main() anyerror!void {
     var allocator = std.heap.c_allocator;
 
-    if(exalted_options.e_dryrun == true) {
+    const params = comptime clap.parseParamsComptime(
+        \\-h, --help             Display this help and exit.
+        \\--dryrun               exit right after argument parsing
+        \\--exe <str>            path of .exe to launch, pause, inject .dll, continue
+        \\--dll <str>            path of .dll to inject into launched .exe
+        \\
+    );
+
+    // Initalize our diagnostics, which can be used for reporting useful errors.
+    // This is optional. You can also pass `.{}` to `clap.parse` if you don't
+    // care about the extra information `Diagnostics` provides.
+    var diag = clap.Diagnostic{};
+    var res = clap.parse(clap.Help, &params, clap.parsers.default, .{
+        .diagnostic = &diag,
+    }) catch |err| {
+        // Report useful error and exit
+        std.log.err("failed to parse arguments: {s}", .{@errorName(err)});
+        return;
+    };
+    defer res.deinit();
+
+    if(res.args.dryrun) {
         log.info("e_dryrun, ending without doing anything", .{});
         return;
     }
 
-    if(exalted_options.e_script) |frida_script_path| {
-        log.info("attaching frida script '{s}'", .{frida_script_path});
-    }
+    const exe_path = res.args.exe orelse {
+        std.log.err(".exe file for injection/attachment must be specified with --exe!", .{});
+        return;
+    };
+
+    // check that exe file exists
+    _ = std.os.access(exe_path, 0) catch |err| {
+        std.log.err("invalid .exe path '{s}':{s}", .{exe_path, @errorName(err)});
+        return;
+    };
+
+    const exe_dir = std.fs.path.dirname(exe_path) orelse unreachable;
+    const exe_name = std.fs.path.basename(exe_path);
+    
+    // FIXME: this fails .. even though the dll path exists?
+    // if(res.args.dll) |dll_path| {
+    //     // _ = std.os.access(dll_path, 0) catch |err| {
+    //     //     std.log.err("invalid .dll path '{s}':{s}", .{dll_path, @errorName(err)});
+    //     //     return;
+    //     // };
+    // }
 
     var tmp = try tmpDir(.{});
     defer tmp.cleanup();    
 
-    const dll_path = b: {
-        var file = try tmp.dir.createFile("injected.dll", .{.exclusive = true});
-        errdefer file.close();
-
-        var buf_stream = std.io.bufferedWriter(file.writer());
-        const st = buf_stream.writer();
-        _ = try st.write(@embedFile("../zig-out/bin/muton.dll"));
-        try buf_stream.flush();
-        file.close();
-
-        break :b tmp.dir.realpathAlloc(allocator, "injected.dll") catch
-            @panic("failed getting realpath for injected.dll");
-    };
-    defer allocator.free(dll_path);
-
-    const frida_script_path: ?[]const u8 = if(exalted_options.e_script) |frida_jspath| convert: {
-        const frida_js_script = @embedFile("../" ++ frida_jspath);
-
-        const frida_script = b: {
-            const b64e = std.base64.standard.Encoder;
-            var outbuf = try allocator.alloc(u8, b64e.calcSize(frida_js_script.len));
-            defer allocator.free(outbuf);
-
-            const frida_source = b64e.encode(outbuf[0..], frida_js_script);
-            break :b try std.fmt.allocPrint(allocator,
-        \\import sys
-        \\import base64
-        \\import frida
-        \\import time
-        \\
-        \\def main():
-        \\    session = frida.attach("XComEW.exe")
-        \\    script = b"{s}"
-        \\    source = base64.b64decode(script).decode("utf-8")
-        \\    script = session.create_script(source)
-        \\    print(">> LOADING SCRIPT <<")
-        \\    script.load()
-        \\    while True:
-        \\        time.sleep(1)
-        \\    # sys.stdin.read()
-        \\    # session.detach()
-        \\    
-        \\main()
-            , .{frida_source});
-        };
-        defer allocator.free(frida_script);
-
-        const frida_script_path = b: {
-            var file = tmp.dir.createFile("trace.py", .{.exclusive = true}) catch
-                @panic("failed creating file for trace.py");
-            errdefer file.close();
-
-            var buf_stream = std.io.bufferedWriter(file.writer());
-            const st = buf_stream.writer();
-            _ = try st.write(frida_script);
-            try buf_stream.flush();
-            file.close();
-
-            break :b tmp.dir.realpathAlloc(allocator, "trace.py") catch
-                @panic("failed getting realpath for trace.py");
-        };
-        std.log.debug("frida-wrapper-script: {s}", .{frida_script_path});
-        break :convert frida_script_path;
-    } else null;
-    defer if(frida_script_path) |fp| allocator.free(fp);
-
-    // TODO: verify that XComEW exists at the given path
-    const XComEW_path = exalted_options.XComEW_path;
-    const XComEW_exepath = exalted_options.XComEW_path ++ "\\XComEW.exe";
-
-    const app_path_w = try unicode.utf8ToUtf16LeWithNull(allocator, XComEW_exepath);
+    const app_path_w = try unicode.utf8ToUtf16LeWithNull(allocator, exe_path);
     defer allocator.free(app_path_w);
     
     const cmd_line_w = try unicode.utf8ToUtf16LeWithNull(allocator, "");
     defer allocator.free(cmd_line_w);
 
-    const cwd_w = try unicode.utf8ToUtf16LeWithNull(allocator, XComEW_path);
+    const cwd_w = try unicode.utf8ToUtf16LeWithNull(allocator, exe_dir);
     defer allocator.free(cwd_w);
 
-    // setup pipe wrapper for XComEW stdout/stderr
+    // setup pipe wrapper for .exe stdout/stderr
     var secAttr: winapi.SECURITY_ATTRIBUTES = .{
         .nLength = @sizeOf(winapi.SECURITY_ATTRIBUTES),
         .lpSecurityDescriptor = null,
@@ -264,7 +162,6 @@ pub fn main() anyerror!void {
     var piProcInfo: winapi.PROCESS_INFORMATION = undefined;
 
     // TODO: shift to some 'winapi' lib
-    const CREATE_SUSPENDED = 4;
 
     try winapi.CreateProcessW(
         app_path_w,
@@ -272,7 +169,7 @@ pub fn main() anyerror!void {
         null,
         null,
         winapi.TRUE,
-        winapi.CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED,
+        winapi.CREATE_UNICODE_ENVIRONMENT | winapi.CREATE_SUSPENDED,
         null,
         // @ptrCast(?*anyopaque, envp_ptr),
         cwd_w,
@@ -285,28 +182,16 @@ pub fn main() anyerror!void {
         winapi.TerminateProcess(piProcInfo.hProcess, 0) catch {};
     }
 
-    const frida_py_handle: ?winapi.HANDLE = if(frida_script_path) |fscript| b: {
-        log.info("injecting frida script", .{});
-        const frida_script_handle = try attachFridaScript(fscript, pipe_write_h);
-        std.time.sleep(4 * std.time.ns_per_s);
-        break :b frida_script_handle;
-    } else null;
-    defer if(frida_py_handle) |h| winapi.TerminateProcess(h, 0) catch {};
-
-    log.info("XComEW.exe launched in suspended state", .{});
-    if(exalted_options.no_inject == true) {
-        log.info("no_inject=true, skipping injection", .{});
-    } else {
-        log.info("injecting .dll", .{});
+    log.info("{s} launched in suspended state", .{exe_name});
+    if(res.args.dll) |dll_path| {
         _ = try winapi.injectDll(piProcInfo.hProcess, dll_path);    
-    }
+    } else log.info("no .dll specified, skipping injection", .{});
 
-    log.info("resuming XComEW.exe", .{});
+    log.info("resuming {s}", .{exe_name});
     _ = winapi.ResumeThread(piProcInfo.hThread);
 
     try winapi.WaitForSingleObject(piProcInfo.hProcess, winapi.INFINITE);
-
-    log.info("XComEW.exe exited", .{});
+    log.info("{s} exited", .{exe_name});
 }
 
     

@@ -1,29 +1,23 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
+const os = std.os;
+const fs = std.fs;
 const log = std.log;
 
 pub fn build(b: *std.build.Builder) !void {
+    if(builtin.os.tag != .windows and builtin.os.tag != .macos) {
+        std.log.err("exalted only supports building on windows or macOS systems", .{});
+        return;
+    }
+
     const target = b.standardTargetOptions(.{});
     const mode = b.standardReleaseOptions();
 
-    const default_xcom_path = "C:\\XCOM Enemy Unknown\\XEW\\Binaries\\Win32\\";
-    const XComEW_path = b.option([]const u8, 
-        "XComEWDirectory", comptime std.fmt.comptimePrint("directory that 'XComEW.exe' resides in (e.g. '{s}')", .{default_xcom_path}),
-    ) orelse default_xcom_path;
-        
-    const exalted_options = b: {
-        // exalted (injector) build options
-        const e_dryrun = b.option(bool, "e_dryrun", "only check that exalted runs on remote system, becomes a no-op program") orelse false;
-        const e_script = b.option([]const u8, "e_script", "embed a frida .js script, to run after dll-injection") orelse null;
-        const no_inject = b.option(bool, "no_inject", "embed a frida .js script, to run after dll-injection") orelse false;
-
-        const build_options = b.addOptions();
-        build_options.addOption(bool, "no_inject", no_inject);
-        build_options.addOption(bool, "e_dryrun", e_dryrun);
-        build_options.addOption(?[]const u8, "e_script", e_script);
-        build_options.addOption([]const u8, "XComEW_path", XComEW_path);
-        break :b build_options;
-    };
+    const default_XComEWexe_path = "C:\\XCOM Enemy Unknown\\XEW\\Binaries\\Win32\\XComEW.exe";
+    const XComEWexe_path = b.option([]const u8, 
+        "XComEWexe", comptime std.fmt.comptimePrint("path that 'XComEW.exe' resides in (e.g. '{s}')", .{default_XComEWexe_path}),
+    ) orelse default_XComEWexe_path;
 
     const muton_options = b: {
         const dump_GNatives = b.option(bool, "dump_GNatives", "after injection, dump out GNative table and exit") orelse false;
@@ -55,13 +49,18 @@ pub fn build(b: *std.build.Builder) !void {
         muton_dll.install();
     }
 
+    const zig_clap = std.build.Pkg{
+        .name = "zig-clap",
+        .path = .{ .path = "dependencies/zig-clap/clap.zig" },
+        .dependencies = &[_]std.build.Pkg{},
+    };
+
     const exe = b.addExecutable("exalted", "src/main.zig");
     {
-        
+        exe.addPackage(zig_clap);
+
         exe.step.dependOn(&muton_dll.install_step.?.step);
 
-        exe.addOptions("exalted_options", exalted_options);
-        
         exe.linkSystemLibrary("c");
 
         exe.linkSystemLibrary("gdi32");
@@ -73,86 +72,81 @@ pub fn build(b: *std.build.Builder) !void {
         exe.install();
     }
 
-    // 'local' run, use if building on non-vm machine
-    const run_step = b.step("run", "Run the app");
-    {
-        // const exalted_path = try std.fmt.allocPrint(b.allocator, "{s}\\bin\\exalted.exe", .{b.install_path});
-        // const local_exec = b.addSystemCommand(&[_][]const u8{
-        //     exalted_path, 
-        // });
-
-        // // TODO: can we check to see if target != i386-windows, and have it error out accordingly?
-        const run_cmd = exe.run();
-        run_cmd.step.dependOn(b.getInstallStep());
-        if (b.args) |args| {
-            run_cmd.addArgs(args);
-        }
-        run_step.dependOn(&run_cmd.step);
-    }
-
-    // 'vm' run, connects to parallels windows VM and runs program
-    //   requires that VM can access directory (and all sub-directorys) this build.zig resides in
-    const vmrun_step = b.step("vmrun", "Run exalted remotely by connecting to a Parallels Windows VM");
-    {
-        vmrun_step.dependOn(b.getInstallStep());
+    if(comptime builtin.os.tag == .macos) {
         const vm_target = b.option([]const u8, "vm", "name of Parallels Windows VM to connect to (default is 'Windows 11')") orelse "Windows 11";
-        
-        // const vm_UUID = b: {
-        //     var child = std.ChildProcess.init(&.{
-        //         "prlctl", "list", "name", vm_target, "--no-header", "-o", "uuid"
-        //     }, b.allocator);
+        const no_dll_inject = b.option(bool, "no_inject", "skip injecting muton.dll") orelse false;
+
+        const home_dir = os.getenv("HOME") orelse {
+            std.log.err("getenv(\"HOME\") must return something for macOS builds", .{});
+            return;
+        };
+
+        std.log.info("{s}", .{@tagName(builtin.os.tag)});
+
+        const remote_exalted_path = b: {
+            const relpath = try fs.path.relative(b.allocator, home_dir, try std.fmt.allocPrint(b.allocator, "{s}/bin/exalted.exe", .{b.install_path}));
+            const remote_path = try fs.path.join(b.allocator, &.{"//Mac/Home/", relpath});
+            std.mem.replaceScalar(u8, remote_path, '/', '\\');
+            break :b remote_path;
+        };
+
+        const remote_muton_path = b: {
+            const relpath = try fs.path.relative(b.allocator, home_dir, try std.fmt.allocPrint(b.allocator, "{s}/bin/muton.dll", .{b.install_path}));
+            const remote_path = try fs.path.join(b.allocator, &.{"//Mac/Home/", relpath});
+            std.mem.replaceScalar(u8, remote_path, '/', '\\');
+            break :b remote_path;
+        };
+
+        // 'vm' run, connects to parallels windows VM and runs program
+        //   requires that VM can access directory (and all sub-directorys) this build.zig resides in
+        const vmrun_step = b.step("vmrun", "Run exalted remotely by connecting to a Parallels Windows VM");
+        {
+            vmrun_step.dependOn(b.getInstallStep());
             
-        //     child.stdin_behavior = .Ignore;
-        //     child.stdout_behavior = .Pipe;
-            
-        //     child.spawn() catch |err| {
-        //         log.warn("Unable to spawn {s}: {s}\n", .{ "prlctl", @errorName(err) });
-        //         return err;
-        //     };
-            
-        //     const stdout = child.stdout.?.reader().readAllAlloc(b.allocator, 600) catch {
-        //         return error.ReadFailure;
-        //     };
-        //     errdefer b.allocator.free(stdout);
+            var exalted_args = std.ArrayList([]const u8).init(b.allocator);
+            try exalted_args.appendSlice(&.{"--exe", try std.fmt.allocPrint(b.allocator, "\\\"{s}\\\"", .{XComEWexe_path})});
+            if(no_dll_inject == false) {
+                try exalted_args.appendSlice(&.{"--dll", try std.fmt.allocPrint(b.allocator, "\\\"{s}\\\"", .{remote_muton_path})});
+            }
 
-        //     const term = try child.wait();
-        //     switch (term) {
-        //         .Exited => |code| {
-        //             if (code != 0) {
-        //                 _ = @truncate(u8, code);
-        //                 return error.ExitCodeFailure;
-        //             }
-        //             const uuid = std.mem.trimRight(u8, stdout, &.{'\n'});
-        //             // strip '{', '}'
-        //             break :b uuid[1..uuid.len-1];
-        //         },
-        //         .Signal, .Stopped, .Unknown => |code| {
-        //             _ = @truncate(u8, code);
-        //             return error.ProcessTerminated;
-        //         },
-        //     }
-        // };
+            const vm_exec = b.addSystemCommand(&[_][]const u8{
+                "prlctl", "exec", vm_target, "--current-user", "powershell", "-Command",
+                b: {
+                    const powershell_cmd = try std.fmt.allocPrint(b.allocator, "& {{Start-Process -NoNewWindow -Wait -FilePath '{s}' -ArgumentList '{s}' }}", .{
+                        remote_exalted_path,
+                        std.mem.join(b.allocator, " ", exalted_args.items),
+                    });
+                    std.log.info("cmd: {s}", .{powershell_cmd});
+                    break :b powershell_cmd;
+                },
+            });
 
-        // log.info("Parallels VM \"{s}\" has UUID \"{s}\"", .{vm_target, vm_UUID});
-        // FIXME: maybe better way to get this path?
-        const exalted_path = try std.fmt.allocPrint(b.allocator, "{s}/bin/exalted.exe", .{b.install_path});
-        const vm_exec = b.addSystemCommand(&[_][]const u8{
-            "prlctl", "exec", vm_target, "--current-user", "-r", "powershell", exalted_path, 
-        });
-        vm_exec.cwd = try std.fmt.allocPrint(b.allocator, "{s}/bin/", .{b.install_path});
+            vmrun_step.dependOn(&vm_exec.step);
+        }
+    } 
 
-        vmrun_step.dependOn(&vm_exec.step);
-    }
+    if(comptime builtin.os.tag == .windows) {
+        // 'local' run, use if building on non-vm machine
+        const run_step = b.step("run", "Run the app");
+        {
+            const run_cmd = exe.run();
+            run_cmd.step.dependOn(b.getInstallStep());
+            if (b.args) |args| {
+                run_cmd.addArgs(args);
+            }
+            run_step.dependOn(&run_cmd.step);
+        }
 
-    // perform various batch/sanity tests
-    const test_step = b.step("test", "Run unit tests");
-    {
-        // TODO: currently no tests, should add some! :P
-        //  maybe if running on non-windows .. see if wine is avaliable & use it for running tests?
-        const exe_tests = b.addTest("src/main.zig");
-        exe_tests.setTarget(target);
-        exe_tests.setBuildMode(mode);
+        // perform various batch/sanity tests
+        const test_step = b.step("test", "Run unit tests");
+        {
+            // TODO: currently no tests, should add some! :P
+            //  maybe if running on non-windows .. see if wine is avaliable & use it for running tests?
+            const exe_tests = b.addTest("src/main.zig");
+            exe_tests.setTarget(target);
+            exe_tests.setBuildMode(mode);
 
-        test_step.dependOn(&exe_tests.step);
+            test_step.dependOn(&exe_tests.step);
+        }
     }
 }
